@@ -46,6 +46,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -60,6 +61,7 @@ CONFIG = Path(__file__).with_name("kuper_stores.json")   # адрес и маг�
 DEFAULT_WORKERS = 4  # одновременных запросов: 8 потоков с отдельным прогревом ловили 403
 WORKERS = DEFAULT_WORKERS
 HEAD_WORDS = 3       # в скольких первых словах названия обязан стоять главный якорь
+NUTRITION_DELAY = 1.0  # пауза между карточками: подряд без паузы третья уже ловила 403
 
 # Магазинов в коде намеренно нет: store_id привязаны к точке доставки, а не к городу,
 # и чужой список молча вернёт цены не того магазина. Список заводится через --discover.
@@ -156,6 +158,68 @@ def search(query: str, store_id: str, retry: bool = True) -> list[dict]:
         return []
 
 
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+# Правила Nominatim требуют опознаваемый User-Agent и не больше запроса в секунду.
+# Запрос тут ровно один на прогон --discover, так что в лимит укладываемся с запасом.
+NOMINATIM_UA = "kuper-prices/1.0 (personal grocery price comparison)"
+
+
+def geocode(address: str, limit: int = 5) -> list[tuple[float, float, str]] | None:
+    """Адрес строкой → координаты через OpenStreetMap. Ключ не нужен, денег не стоит.
+
+    Возвращает список кандидатов, а не один ответ: выбирать за пользователя нельзя.
+    Набор магазинов Купера привязан к точке доставки, и промах по дому меняет выдачу.
+
+    **`None` и `[]` — разные вещи, и путать их нельзя.** `[]` значит «спросили, такого
+    адреса нет»; `None` — «спросить не вышло»: сеть легла или Nominatim придержал за
+    частые запросы (у него лимит — запрос в секунду). Если свести оба случая к пустому
+    списку, пользователю скажут «адрес не найден» там, где адрес прекрасный, а виноват
+    троттлинг. Та же ошибка, что «403 ≠ ничего не найдено» на стороне Купера.
+    """
+    import urllib.parse
+    import urllib.request
+
+    if not address.strip():
+        return []
+    url = f"{NOMINATIM}?" + urllib.parse.urlencode(
+        {"q": address, "format": "jsonv2", "limit": limit, "addressdetails": 1})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": NOMINATIM_UA})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    out = []
+    for r in data:
+        try:
+            out.append((float(r["lat"]), float(r["lon"]), str(r.get("display_name") or "")))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def user_address() -> tuple[float, float, str] | None:
+    """Координаты сохранённого адреса доставки, если Купер их отдаёт этой сессии.
+
+    Работает только когда сессия узнаёт пользователя; анонимному прогреву адрес
+    взять неоткуда, и это нормальный исход — тогда координаты задаются вручную
+    через --lat/--lon. Ничего не сохраняет: адрес личный, а скилл публичный.
+    """
+    try:
+        r = session().get(f"{BASE}/api/v2/cart-api/carts/user-context",
+                          headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            return None
+        a = ((r.json().get("data") or {}).get("address") or {})
+        lat, lon = a.get("lat"), a.get("lon")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return None
+        label = ", ".join(x for x in (a.get("city"), a.get("street"), a.get("building")) if x)
+        return float(lat), float(lon), label
+    except Exception:
+        return None
+
+
 def discover_stores(lat: float, lon: float) -> list[dict]:
     """Какие магазины доставляют по этим координатам.
 
@@ -210,6 +274,16 @@ def parse_volume(product: dict) -> tuple[str, float] | tuple[None, None]:
     return None, None
 
 
+def product_url(product: dict) -> str:
+    """Ссылка на карточку товара.
+
+    Адрес карточки — `/products/{sku}-{slug}`: ровно то, что Купер сам зовёт
+    `canonical_permalink`. Собирается арифметически, лишнего запроса не нужно.
+    """
+    sku, slug = product.get("sku"), product.get("slug")
+    return f"{BASE}/products/{sku}-{slug}" if sku and slug else ""
+
+
 def offer(product: dict, store: str) -> dict:
     base, amount = parse_volume(product)
     price = product.get("price")
@@ -222,7 +296,82 @@ def offer(product: dict, store: str) -> dict:
         "base": base or "?",
         "per": per,                                    # цена за кг/л/шт — по ней сортируем
         "discount": product.get("discount_percent") or 0,
+        "url": product_url(product),
+        # для добора БЖУ карточкой; в дампе из браузера их может не быть
+        "slug": product.get("slug") or "",
+        "store_id": str(product.get("store_id") or ""),
+        "nutrition": None,                             # заполняется только с --nutrition
     }
+
+
+# Купер отдаёт нутриенты плоским списком свойств; берём четыре и состав.
+# Значения — всегда на 100 г продукта (так подписан и блок на самой карточке).
+NUTRIENT_KEYS = {"protein": "b", "fat": "f", "carbohydrate": "c", "energy_value": "kcal"}
+NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def parse_nutrition(payload: dict) -> dict | None:
+    """product_properties карточки → {b, f, c, kcal, ingredients} на 100 г.
+
+    Отдельно от сети, чтобы разбор можно было проверять на сохранённом ответе,
+    не дёргая Купер (а его лишний раз дёргать нельзя — ловится 403).
+    """
+    props = ((payload.get("data") or {}).get("product_properties") or [])
+    out: dict[str, float | str] = {}
+    for p in props:
+        key = NUTRIENT_KEYS.get(p.get("name") or "")
+        if key:
+            m = NUM_RE.search(str(p.get("value") or ""))
+            if m:
+                out[key] = float(m.group().replace(",", "."))
+        elif p.get("name") == "ingredients":
+            out["ingredients"] = str(p.get("value") or "")
+    # без единого числа считаем, что нутриентов у товара нет (бытовая химия, посуда)
+    return out if any(k in out for k in ("b", "f", "c", "kcal")) else None
+
+
+def nutrition(slug: str, store_id: str) -> dict | None:
+    """БЖУ и калорийность на 100 г с карточки товара. Один запрос на товар."""
+    if not slug or not store_id:
+        return None
+    try:
+        r = session().get(
+            f"{BASE}/api/v3/multicards",
+            params={"store_id": store_id, "permalink": slug,
+                    "tenant_id": "sbermarket", "anonymous_id": str(uuid.uuid4())},
+            headers=HEADERS, timeout=30)
+    except Exception:
+        return None
+    if r.status_code == 403:
+        raise Blocked(f"403 на карточке товара «{slug}»")
+    if r.status_code != 200:
+        return None
+    try:
+        return parse_nutrition(r.json())
+    except Exception:
+        return None
+
+
+def add_nutrition(results: dict[str, list[dict]]) -> str | None:
+    """Дозаполнить БЖУ у показываемых товаров. Возвращает текст предупреждения или None.
+
+    Запросы идут строго по одному и только для тех товаров, что попали в вывод:
+    карточка стоит запрос на товар, и веерный добор ловит 403 за десяток обращений.
+    403 здесь не валит прогон — цены уже собраны, и терять их из-за необязательной
+    добавки нельзя. Товары без БЖУ просто остаются с прочерком.
+    """
+    todo = [o for offers in results.values() for o in offers if o.get("slug")]
+    for i, o in enumerate(todo):
+        try:
+            o["nutrition"] = nutrition(o["slug"], o["store_id"])
+        except Blocked:
+            done = i
+            return (f"БЖУ добрано только для {done} из {len(todo)} товаров: Купер начал "
+                    f"отдавать 403 на карточках. Цены в таблице полные — они собраны "
+                    f"раньше. Повтори с --nutrition через 10–15 минут или уменьши --top.")
+        if i + 1 < len(todo):
+            time.sleep(NUTRITION_DELAY)
+    return None
 
 
 def filter_and_sort(raw_offers: list[dict], anchors: list[str], excludes: list[str],
@@ -293,11 +442,13 @@ for (const q of QUERIES) {{
       }});
       if (!r.ok) return;
       const j = await r.json();
-      // только поля, которые нужны обработке — иначе дамп раздувается в сотни КБ
+      // только поля, которые нужны обработке — иначе дамп раздувается в сотни КБ.
+      // sku/slug/store_id нужны для ссылки на карточку и добора БЖУ: три короткие
+      // строки на товар, дамп от них практически не растёт.
       for (const p of (j.products || []).slice(0, {depth})) acc.push({{
         store, name: p.name, price: p.price, human_volume: p.human_volume,
         grams_per_unit: p.grams_per_unit, discount_percent: p.discount_percent,
-        available: p.available
+        available: p.available, sku: p.sku, slug: p.slug, store_id: p.store_id
       }});
     }} catch (e) {{}}
   }}));
@@ -377,19 +528,34 @@ def read_queries(path: Path) -> list[str]:
     return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
 
 
-def render(results: dict[str, list[dict]]) -> str:
+def render(results: dict[str, list[dict]], with_nutrition: bool = False) -> str:
     out = []
     for query, offers in results.items():
         out.append(f"\n### {query}")
         if not offers:
             out.append("_ничего не найдено — ослабь якоря или проверь запрос_")
             continue
-        out.append("| ₽/ед | цена | объём | магазин | товар |")
-        out.append("|---:|---:|---|---|---|")
+        if with_nutrition:
+            out.append("| ₽/ед | цена | объём | магазин | товар | ккал | Б | Ж | У |")
+            out.append("|---:|---:|---|---|---|---:|---:|---:|---:|")
+        else:
+            out.append("| ₽/ед | цена | объём | магазин | товар |")
+            out.append("|---:|---:|---|---|---|")
         for o in offers:
             per = f"{o['per']:.0f} ₽/{o['base']}" if o["per"] is not None else "—"
             skidka = f" −{o['discount']}%" if o["discount"] else ""
-            out.append(f"| {per} | {o['price']:.0f}{skidka} | {o['vol']} | {o['store']} | {o['name']} |")
+            # название — ссылкой на карточку, чтобы можно было открыть товар из таблицы
+            name = f"[{o['name']}]({o['url']})" if o.get("url") else o["name"]
+            row = f"| {per} | {o['price']:.0f}{skidka} | {o['vol']} | {o['store']} | {name} |"
+            if with_nutrition:
+                n = o.get("nutrition") or {}
+                cells = " ".join(
+                    f"{n[k]:g} |" if k in n else "— |" for k in ("kcal", "b", "f", "c"))
+                row += " " + cells
+            out.append(row)
+        if with_nutrition:
+            out.append("")
+            out.append("_БЖУ и ккал — на 100 г продукта._")
     return "\n".join(out)
 
 
@@ -406,11 +572,15 @@ def main() -> int:
     ap.add_argument("--stores", help="только эти магазины, через запятую")
     ap.add_argument("--json", action="store_true", help="выдать JSON вместо таблицы")
     ap.add_argument("--no-bad", action="store_true", help="не применять чёрный список (отладка пустой выдачи)")
+    ap.add_argument("--nutrition", action="store_true",
+                    help="добрать БЖУ и ккал на 100 г с карточек (по запросу на товар — медленно)")
     ap.add_argument("--discover", action="store_true",
                     help="показать магазины по координатам и записать их в kuper_stores.json")
     ap.add_argument("--lat", type=float, help="широта точки доставки (для --discover)")
     ap.add_argument("--lon", type=float, help="долгота точки доставки (для --discover)")
-    ap.add_argument("--address", default="", help="подпись адреса для kuper_stores.json")
+    ap.add_argument("--address", default="",
+                    help="адрес строкой: и подпись для kuper_stores.json, и источник "
+                         "координат, если --lat/--lon не заданы")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                     help=f"сколько магазинов опрашивать разом (по умолчанию {DEFAULT_WORKERS}; "
                          "больше — выше риск словить 403)")
@@ -428,9 +598,42 @@ def main() -> int:
     if args.discover:
         lat = args.lat if args.lat is not None else cfg.get("lat")
         lon = args.lon if args.lon is not None else cfg.get("lon")
+        if (lat is None or lon is None) and args.address:
+            # Адрес назвали строкой — считаем координаты сами.
+            found = geocode(args.address)
+            if found is None:
+                return print(
+                    f"геокодер не ответил, адрес «{args.address}» проверить не удалось.\n"
+                    "Это не значит, что адрес плохой: у OpenStreetMap лимит — запрос в "
+                    "секунду, частые попытки он придерживает.\n"
+                    "Подожди несколько секунд и повтори, либо передай --lat/--lon вручную."
+                ) or 3
+            if len(found) == 1:
+                lat, lon, label = found[0]
+                print(f"адрес распознан: {label}\n  координаты: {lat}, {lon}")
+            elif len(found) > 1:
+                print(f"адрес «{args.address}» неоднозначный, подходящих точек: {len(found)}. "
+                      f"Выбери нужную и передай координаты явно:")
+                for la, lo, name in found:
+                    print(f"  --lat {la} --lon {lo}   {name[:80]}")
+                return 2
+            else:
+                print(f"не удалось определить координаты по адресу «{args.address}». "
+                      f"Уточни его (город, улица, дом) или передай --lat/--lon вручную.")
+                return 2
+
         if lat is None or lon is None:
-            return print("нужны --lat и --lon точки доставки "
-                         "(координаты адреса — из карт: правый клик → «что здесь»)") or 2
+            # Последняя попытка перед тем как сдаться: вдруг сессия узнаёт пользователя
+            # и его адрес доставки можно взять у самого Купера.
+            found_addr = user_address()
+            if found_addr:
+                lat, lon, label = found_addr
+                print(f"адрес взят из аккаунта Купера: {label} ({lat}, {lon})")
+            else:
+                return print("нужна точка доставки. Любой из способов:\n"
+                             "  --address \"Город, улица, дом\"     — координаты посчитаю сам\n"
+                             "  --lat <широта> --lon <долгота>    — если знаешь точно\n"
+                             "координаты вручную — из карт: правый клик → «что здесь»") or 2
 
         found = discover_stores(lat, lon)
         # Полка отдаёт только первую десятку (has_more), и в неё попадают не все сети —
@@ -529,13 +732,17 @@ def main() -> int:
                   "Либо подождать 10–15 минут: блокировка временная.", file=sys.stderr)
             return 3
 
+    warn = add_nutrition(results) if args.nutrition else None
+
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=1))
     else:
-        print(render(results))
+        print(render(results, with_nutrition=args.nutrition))
         empty = [q for q, o in results.items() if not o]
         if empty:
             print(f"\n_пусто по запросам: {', '.join(empty)} — попробуй --no-bad или другие якоря_")
+    if warn:
+        print(f"\n⚠️  {warn}", file=sys.stderr)
     return 0
 
 
