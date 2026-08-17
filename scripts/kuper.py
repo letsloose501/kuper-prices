@@ -274,14 +274,24 @@ def parse_volume(product: dict) -> tuple[str, float] | tuple[None, None]:
     return None, None
 
 
-def product_url(product: dict) -> str:
+def product_url(product: dict, store_id: str | int | None = None) -> str:
     """Ссылка на карточку товара.
 
-    Адрес карточки — `/products/{sku}-{slug}`: ровно то, что Купер сам зовёт
-    `canonical_permalink`. Собирается арифметически, лишнего запроса не нужно.
+    Адрес карточки — `/product/{slug}`, и `slug` тут и есть перманентная ссылка:
+    её же мы шлём в карточку товара параметром `permalink` (см. `nutrition`).
+
+    ⚠️ Раньше здесь клеилось `/products/{sku}-{slug}` — такой адрес не открывается,
+    отдаёт пустую страницу (проверено 17.08.2026 на живых ссылках). Два отличия:
+    `product` в единственном числе и никакого числового префикса sku.
+
+    `?sid={store_id}` прибивает карточку к нужному магазину — без него Купер
+    покажет товар в текущем выбранном, где цены другие или товара нет вовсе.
     """
-    sku, slug = product.get("sku"), product.get("slug")
-    return f"{BASE}/products/{sku}-{slug}" if sku and slug else ""
+    slug = product.get("slug")
+    if not slug:
+        return ""
+    sid = store_id if store_id is not None else product.get("store_id")
+    return f"{BASE}/product/{slug}?sid={sid}" if sid else f"{BASE}/product/{slug}"
 
 
 def offer(product: dict, store: str) -> dict:
