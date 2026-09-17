@@ -1,0 +1,6 @@
+# Личное: адрес доставки и подобранные под него store_id
+scripts/kuper_stores.json
+scripts/queries.txt
+
+__pycache__/
+*.pyc
